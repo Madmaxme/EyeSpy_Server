@@ -20,8 +20,8 @@ RUN pip install gunicorn
 # Copy the rest of the application
 COPY . /app/
 
-# Make startup script executable
-RUN chmod +x /app/startup.sh
+# Fix line endings in startup script and make it executable
+RUN sed -i 's/\r$//' /app/startup.sh && chmod +x /app/startup.sh
 
 # Expose the port the app runs on
 EXPOSE 8080
