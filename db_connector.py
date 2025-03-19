@@ -11,8 +11,12 @@ import json
 import datetime
 import logging
 import tempfile
+from dotenv import load_dotenv
 
 _pool_initialized = False
+
+load_dotenv()
+
 
 
 # Setup logging
@@ -89,8 +93,9 @@ def start_cloud_sql_proxy(instance_connection_name):
     else:
         proxy_path = proxy_binary_path
     
-    # Set up local TCP port for the proxy (e.g., 5433 to avoid conflicts with local PostgreSQL)
-    local_port = 5433
+    # Set up local TCP port for the proxy - use environment variable to make this configurable
+    # This allows different ports for different environments
+    local_port = int(os.environ.get("LOCAL_PROXY_PORT", 5433))
     
     try:
         # Start the proxy process - updated command format for v2.x
@@ -150,6 +155,16 @@ def is_running_in_cloud():
     # In Cloud Run, this directory exists and contains the socket
     return os.path.exists('/cloudsql')
 
+DEFAULT_LOCAL_PORT = 5434
+DEFAULT_DB_CONFIG = {
+    "instance_connection_name": "eyespy-453816:europe-west9:eyespy-db",
+    "db_user": "postgres",
+    "db_pass": "Madmaxme",
+    "db_name": "postgres",
+    "db_port": DEFAULT_LOCAL_PORT
+}
+
+# Then update your init_connection_pool function to use these defaults:
 def init_connection_pool():
     """Initialize the connection pool."""
     global pool, _pool_initialized
@@ -157,6 +172,34 @@ def init_connection_pool():
     if pool is not None and _pool_initialized:
         logger.info("Database connection pool already initialized, reusing existing pool")
         return pool
+    
+    # Debug environment variables
+    database_url = os.environ.get("DATABASE_URL")
+    logger.info(f"Environment DATABASE_URL: {database_url}")
+    db_user = os.environ.get("DB_USER")
+    logger.info(f"Environment DB_USER: {db_user}")
+    db_pass = os.environ.get("DB_PASS")
+    logger.info(f"Environment DB_PASS: {'*****' if db_pass else None}")
+    db_name = os.environ.get("DB_NAME")
+    logger.info(f"Environment DB_NAME: {db_name}")
+    instance_connection_name = os.environ.get("INSTANCE_CONNECTION_NAME")
+    logger.info(f"Environment INSTANCE_CONNECTION_NAME: {instance_connection_name}")
+    local_proxy_port = os.environ.get("LOCAL_PROXY_PORT")
+    logger.info(f"Environment LOCAL_PROXY_PORT: {local_proxy_port}")
+    
+    # Use default DATABASE_URL for local development if none provided
+    if not database_url and not is_running_in_cloud():
+        logger.info("No DATABASE_URL provided, using default local development configuration")
+        db_user = db_user or DEFAULT_DB_CONFIG["db_user"]
+        db_pass = db_pass or DEFAULT_DB_CONFIG["db_pass"]
+        db_name = db_name or DEFAULT_DB_CONFIG["db_name"]
+        instance_connection_name = instance_connection_name or DEFAULT_DB_CONFIG["instance_connection_name"]
+        local_proxy_port = local_proxy_port or str(DEFAULT_DB_CONFIG["db_port"])
+        os.environ["LOCAL_PROXY_PORT"] = local_proxy_port
+        
+        # Construct DATABASE_URL from defaults
+        database_url = f"postgresql://{db_user}:{db_pass}@localhost:{local_proxy_port}/{db_name}?host=/cloudsql/{instance_connection_name}"
+        logger.info(f"Using constructed DATABASE_URL for local development: {database_url.replace(db_pass, '*****')}")
     
     
     # Check for DATABASE_URL first (new format)
