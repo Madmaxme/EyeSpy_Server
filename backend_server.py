@@ -5,13 +5,12 @@ import threading
 import logging
 import signal
 import sys
-from db_connector import init_connection_pool, validate_database_connection
+import tempfile
 from flask import Flask, request, jsonify
-import FaceUpload
-from bio_integration import integrate_with_controller as integrate_bio
-from record_integration import integrate_records_with_controller as integrate_records
 from werkzeug.utils import secure_filename
 
+# Import the controller instead of individual components
+import controller
 
 # Set up logging
 logging.basicConfig(
@@ -23,68 +22,12 @@ logger = logging.getLogger("Backend")
 # Create Flask app
 app = Flask(__name__)
 
-# Initialize database pool
-try:
-    init_connection_pool()
-    logger.info("Database connection pool initialized successfully")
-except Exception as e:
-    logger.error(f"Failed to initialize database connection: {str(e)}")
-    # Don't fail the whole app if DB connection fails - Cloud Run needs the HTTP server to start
+# Create a temporary directory for uploads
+UPLOAD_FOLDER = tempfile.mkdtemp()
 
-# Create directories for data storage
-import tempfile
-UPLOAD_FOLDER = tempfile.mkdtemp()  # Create a temporary directory for uploads that will be cleaned up
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_search_results")
-
-# Create results directory if it doesn't exist
-if not os.path.exists(RESULTS_DIR):
-    os.makedirs(RESULTS_DIR)
-    print(f"Created results directory: {RESULTS_DIR}")
-
-# Update FaceUpload's results directory
-FaceUpload.RESULTS_DIR = RESULTS_DIR
-
+# Configure Flask app settings
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max upload size
-
-# Initialize components and integrate functionality
-def initialize_components():
-    """Initialize all backend components"""
-    components_status = {
-        "record_checking": True,
-        "bio_generation": True
-    }
-    
-    # Initialize record checking FIRST if available
-    try:
-        # Check if RECORDS_API_KEY is set in environment
-        if not os.getenv("RECORDS_API_KEY"):
-            print("[BACKEND] Warning: RECORDS_API_KEY not set. Record checking will be disabled.")
-        else:
-            # Integrate record checking
-            components_status["record_checking"] = integrate_records()
-            print("[BACKEND] Record checking enabled and integrated.")
-    except Exception as e:
-        print(f"[BACKEND] Error initializing record checking: {e}")
-    
-    # Initialize bio generation AFTER record checking
-    try:
-        # Check if OPENAI_API_KEY is set in environment
-        if not os.getenv("OPENAI_API_KEY"):
-            print("[BACKEND] Warning: OPENAI_API_KEY not set. Bio generation will be disabled.")
-        else:
-            # Integrate bio generation
-            components_status["bio_generation"] = integrate_bio()
-            print("[BACKEND] Bio generation enabled and integrated.")
-    except Exception as e:
-        print(f"[BACKEND] Error initializing bio generation: {e}")
-    
-    # Print component status summary
-    print("\n[BACKEND] System Components Status:")
-    for component, status in components_status.items():
-        status_str = "ENABLED" if status else "DISABLED"
-        print(f"  - {component}: {status_str}")
-    print("")
 
 # API routes
 @app.route('/api/health', methods=['GET'])
@@ -124,7 +67,7 @@ def upload_face():
         # Extract face_id from filename
         face_id = os.path.splitext(filename)[0]
         
-        # Process the face in a background thread to avoid blocking the API response
+        # Process the face in a background thread using the controller
         thread = threading.Thread(
             target=process_face_thread,
             args=(file_path, face_id),
@@ -146,15 +89,30 @@ def process_face_thread(face_path, face_id=None):
         if face_id is None:
             face_id = os.path.splitext(os.path.basename(face_path))[0]
             
-        success = FaceUpload.process_single_face(face_path)
-        if success:
-            logger.info(f"Successfully processed: {os.path.basename(face_path)}")
-        else:
-            logger.error(f"Failed to process: {os.path.basename(face_path)}")
+        # IMPORTANT: Process the face directly with FaceUpload FIRST
+        # This prevents the file deletion race condition
+        try:
+            import FaceUpload
+            logger.info(f"Directly processing face with FaceUpload: {os.path.basename(face_path)}")
+            success = FaceUpload.process_single_face(face_path)
+            
+            if success:
+                logger.info(f"Successfully processed face with FaceUpload: {os.path.basename(face_path)}")
+                
+                # Now queue additional processing (bio and records) through the controller
+                # Just pass the face_id since we don't need the file anymore
+                controller.process_additional_steps(face_id)
+            else:
+                logger.error(f"Failed to process face with FaceUpload: {os.path.basename(face_path)}")
+        except Exception as e:
+            logger.error(f"Error processing face with FaceUpload: {str(e)}")
+            success = False
+            
     except Exception as e:
-        logger.error(f"Error processing face: {str(e)}")
+        logger.error(f"Error in face processing thread: {str(e)}")
+        success = False
     finally:
-        # Clean up the uploaded file after processing
+        # Clean up the uploaded file after FaceUpload has processed it
         try:
             if os.path.exists(face_path):
                 os.remove(face_path)
@@ -171,32 +129,47 @@ def main():
     ║       Face Processing & Identity Search     ║
     ╚═════════════════════════════════════════════╝
     """)
-
-    validate_database_connection()
     
-    # Initialize components
-    initialize_components()
-
-    validate_database_connection()
+    # First, create the controller instance to load .env file
+    # But don't fully initialize components yet
+    controller.controller  # This ensures the controller singleton is created
     
-    # Default port
-    port = int(os.environ.get('PORT', 8080))
-    
-    # Parse command line arguments manually for tokens
+    # Parse command line arguments manually for tokens BEFORE full initialization
+    print("Parsing command line arguments...")
     args = sys.argv[1:]
     i = 0
     while i < len(args):
         if args[i] == '--token' and i+1 < len(args):
             os.environ['FACECHECK_API_TOKEN'] = args[i+1]
+            print(f"Set FACECHECK_API_TOKEN from command line")
             i += 2
         elif args[i] == '--firecrawl-key' and i+1 < len(args):
             os.environ['FIRECRAWL_API_KEY'] = args[i+1]
+            print(f"Set FIRECRAWL_API_KEY from command line")
             i += 2
         elif args[i] == '--port' and i+1 < len(args):
-            port = int(args[i+1])
+            os.environ['PORT'] = args[i+1]
+            print(f"Set PORT from command line to {args[i+1]}")
             i += 2
         else:
             i += 1
+    
+    # NOW initialize the controller with reloaded config
+    if not controller.initialize(reload_config=True):
+        print("Failed to initialize controller, exiting")
+        return
+    
+    # Default port
+    port = int(os.environ.get('PORT', 8080))
+    
+    # Set up signal handlers for graceful shutdown
+    def signal_handler(sig, frame):
+        print("\nShutting down EyeSpy server...")
+        controller.shutdown()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
     # Start the server
     print(f"[BACKEND] Starting server on port {port}...")
